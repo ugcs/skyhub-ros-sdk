@@ -315,7 +315,7 @@ private:
       //Send to log
       m_log->WriteRecord(record);
       //Send to CPM on Ground:
-      m_ground->sendScalarValue(temp,
+      m_ground->sendScalarValue(ch4,
                                 MonitorMessage::PAYLOAD_ID_USER_PAYLOAD_FIRST,
                                 0xC0, //Place this ID into Payload Example widget settings
                                 MonitorMessage::STATE_GOOD);
