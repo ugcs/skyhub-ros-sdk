@@ -26,10 +26,9 @@
  */
 using ugcs_skyhub::payloads::DriverNode;
 using ugcs_skyhub::payloads::Address;
-using ugcs_skyhub::connections::SerialConnection;
+using ugcs_skyhub::connections::UartConnection;
 using ugcs_skyhub::datalogs::DataLog;
 using ugcs_skyhub::topics::autopilot::MonitorScalarTopic;
-using ugcs_skyhub::connections::InfoSeverity;
 
 /**
  * To implement driver's port registration, we'll need Configuration Service,
@@ -91,13 +90,19 @@ public:
    */
   ParamSet getParameters() override
   {
-    /*Add received port name from configuration as a value of driver specific parameter:
-    * name of UART device. This is OS-specific name
-    */
-    return {
-        {"DEV_UART", "/dev/ttyUSB0"},
-        {"BAUD_RATE", "115200"},
-    };
+      /*First, we ask Configuration service to add default UART port definition to configuration
+      * On successful call serivce return port name. This name may be used with Communication
+      * service to open pre-configured resources.
+      */
+      std::string uart_id = getConfigService()->addUartPort();
+
+      //Parameter set for our driver
+      ParamSet ps;
+      /*Add received port name from configuration as a value of driver specific parameter:
+      * name of UART device. This is not OS-specific name,  but ID of configured resource
+      */
+      ps["DEV_UART"] = uart_id;
+      return ps;
   }
 
   /**
@@ -119,31 +124,19 @@ public:
      */
     m_ground = getConnectionService()->connectGround();
 
+    //Obtain port name:
+    std::string port = getParam<std::string>(params, "DEV_UART");
+
     /* Get UART connection object and store it to internal variable
      * Port is not opened at this step.
      */
-    m_connect = getConnectionService()->connectUart(params,
-            std::bind(&GasAnalyzerDriver::onData, this, std::placeholders::_1, std::placeholders::_2),
+    m_connect = getConnectionService()->connectUart(port,
             /*
              * We use default error handling for async reading, provided by Connection Service.
              * This routine will catch exceptions at reading thread and write them to log and
              * send to CPM.
              */
-            std::bind(&ConnectionService::OnAsyncError, getConnectionService(), std::placeholders::_1),
-            [this](const std::string& msg, InfoSeverity info_severity) {
-              switch (info_severity)
-              {
-                case InfoSeverity::NORMAL:
-                  LOG.info() << msg;
-                  break;
-                case InfoSeverity::WARNING:
-                  LOG.warn() << msg;
-                  break;
-                case InfoSeverity::ERROR:
-                  LOG.fatal() << msg;
-                  break;
-              }
-            });
+            std::bind(&ConnectionService::OnAsyncError, getConnectionService(), std::placeholders::_1));
   }
 
   /**
@@ -156,8 +149,23 @@ public:
     if(instance != 0)
       return;
 
-    //Now, open the UART port there gas analyzer fos configured:
-    m_connect->open();
+    //Now, open the UART port there GNSS driver we detected:
+    m_connect->connect();
+    /**
+     * Launch infinite reading loop. This call is non-blocking and always return as loop is
+     * started on separate thread. This loop is supported by SDK implementation and user must
+     * only to define what to do with obtained data. See the data processing implementation below.
+     *
+     * onData will get from 1 to READ_BUFFER_SIZE bytes of data to parse or to process in any other way.
+     *
+     * Developer may stop this loop by stopAsyncRead. Only one async loop is support for every opened
+     * connection.
+     */
+    m_connect->startAsyncReadLoop(
+          [this](std::vector<char> data, const size_t len){
+            this->onData(data, len);
+          },
+          READ_BUFFER_SIZE);
   }
 
   /**
@@ -169,11 +177,15 @@ public:
     //Work for single instance only:
     if(instance != 0)
       return;
-    /*Just close any opened connections. Any asynchronous operations will be stopped automatically.
-     * The finishing of running operations may take some time and this method will wait for their
-     * completion.
+    /*
+     * Stop infinite loop if it was started
      */
-    m_connect->close();
+    m_connect->stopAsyncReadLoop();
+    /*Just close any opened connections. Any asyncronous operations will be stoped automatically.
+     * The finishing of running operations may take some time and this method will wait for their
+     * compleation.
+     */
+    m_connect->disconnect();
   }
 
 private:
@@ -182,9 +194,8 @@ private:
    * The data parameter is a byte array of received data and the len is actual size of stored bytes.
    * len <= data.size() for always
    */
-  void onData(const uint8_t* raw_data, size_t len)
+  void onData(std::vector<char> data, const size_t len)
   {
-      std::vector<char> data(raw_data, raw_data + len);
       //Parse incoming data:
       parseData(data, len);
   }
@@ -303,7 +314,7 @@ private:
   }
 
   //Here we store UART connection resource:
-  std::shared_ptr<ugcs_skyhub::connections::SerialConnection> m_connect;
+  std::shared_ptr<ugcs_skyhub::connections::UartConnection> m_connect;
   //Link to common log:
   std::shared_ptr<DataLog> m_log;
   //Channel to the ground:
