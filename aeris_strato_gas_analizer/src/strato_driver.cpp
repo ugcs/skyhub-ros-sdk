@@ -17,18 +17,19 @@
  */
 #include <ugcs_skyhub/connection_ground.h>
 /**
- * Use Altimeter widget to display data:
+ * Topics for CPM communication:
  */
-#include <skyhub_msgs/msg/monitor_message.hpp>
+#include <ugcs_skyhub/autopilot_topics.h>
 
 /**
  * Import full names of classes we are going to use:
  */
 using ugcs_skyhub::payloads::DriverNode;
 using ugcs_skyhub::payloads::Address;
-using ugcs_skyhub::connections::UartConnection;
+using ugcs_skyhub::connections::SerialConnection;
 using ugcs_skyhub::datalogs::DataLog;
-using skyhub_msgs::msg::MonitorMessage;
+using ugcs_skyhub::topics::autopilot::MonitorScalarTopic;
+using ugcs_skyhub::connections::InfoSeverity;
 
 /**
  * To implement driver's port registration, we'll need Configuration Service,
@@ -90,23 +91,13 @@ public:
    */
   ParamSet getParameters() override
   {
-    /*First, we ask Configuration service to add default UART port definition to configuration
-    * On successful call serivce return port name.
-    */
-    std::string uart_id = getConfigService()->addUartPort();
-
-    std::string log = getConfigService()->addDataLog();
-
-    //Parameter set for our driver
-    ParamSet ps;
     /*Add received port name from configuration as a value of driver specific parameter:
-    * name of UART device. This is not OS-specific name,  but ID of configured resource
+    * name of UART device. This is OS-specific name
     */
-    ps["DEV_UART"] = uart_id;
-    /* Add received log into param set:
-     */
-    ps["DATALOG_NAME"] = log;
-    return ps;
+    return {
+        {"DEV_UART", "/dev/ttyUSB0"},
+        {"BAUD_RATE", "115200"},
+    };
   }
 
   /**
@@ -118,44 +109,41 @@ public:
     if(instance != 0)
       return;
 
-    //Obtain log instance:
     /**
-     * Search for datalog name in parameters. We expect if was configured at "register payload" step.
+     * Get instance of named log. This log is manager by DataLog Service:
      */
-    auto log_name = params.find("DATALOG_NAME");
-    //Report error if no log name found
-    if(log_name == params.end())
-      throw std::invalid_argument("Datalog name was not configured");
-
-    /**
-     * Get instance of named log. This log is manager by DataLog Service and accessible as pre-configured
-     * resource by it's name
-     */
-    m_log = getDatalogService()->getDataLog(log_name->second);
+    m_log = getDatalogService()->getCsvDataLog("strato");
 
     /**
      * Get connection to the Ground software: show data with CPM
      */
     m_ground = getConnectionService()->connectGround();
 
-    //Obtain port name:
-    std::string port;
-    auto uart_dev = params.find("DEV_UART");
-    if(uart_dev != params.end())
-      port = uart_dev->second;
-    else
-      throw std::invalid_argument("Port name not found");
-
     /* Get UART connection object and store it to internal variable
      * Port is not opened at this step.
      */
-    m_connect = getConnectionService()->connectUart(port,
-    /*
-     * We use default error handling for async reading, provided by Connection Service.
-     * This routine will catch exceptions at reading thread and write them to log and
-     * send to CPM.
-     */
-    std::bind(&ConnectionService::OnAsyncError, getConnectionService(), std::placeholders::_1));
+    m_connect = getConnectionService()->connectUart(params,
+            std::bind(&GasAnalyzerDriver::onData, this, std::placeholders::_1, std::placeholders::_2),
+            /*
+             * We use default error handling for async reading, provided by Connection Service.
+             * This routine will catch exceptions at reading thread and write them to log and
+             * send to CPM.
+             */
+            std::bind(&ConnectionService::OnAsyncError, getConnectionService(), std::placeholders::_1),
+            [this](const std::string& msg, InfoSeverity info_severity) {
+              switch (info_severity)
+              {
+                case InfoSeverity::NORMAL:
+                  LOG.info() << msg;
+                  break;
+                case InfoSeverity::WARNING:
+                  LOG.warn() << msg;
+                  break;
+                case InfoSeverity::ERROR:
+                  LOG.fatal() << msg;
+                  break;
+              }
+            });
   }
 
   /**
@@ -169,19 +157,7 @@ public:
       return;
 
     //Now, open the UART port there gas analyzer fos configured:
-    m_connect->connect();
-    /**
-     * Launch infinite reading loop. This call is non-blocking and always return as loop is
-     * started on separate thread. This loop is supported by SDK implementation and user must
-     * only define what to do with obtained data.
-     *
-     * onData will get from 1 to READ_BUFFER_SIZE bytes of data to parse or to process in any other way.
-     */
-    m_connect->startAsyncReadLoop(
-          [this](std::vector<char> data, const size_t len){
-            this->onData(data, len);
-          },
-          READ_BUFFER_SIZE);
+    m_connect->open();
   }
 
   /**
@@ -193,15 +169,11 @@ public:
     //Work for single instance only:
     if(instance != 0)
       return;
-    /*
-     * Stop infinite loop if it was started
-     */
-    m_connect->stopAsyncReadLoop();
     /*Just close any opened connections. Any asynchronous operations will be stopped automatically.
      * The finishing of running operations may take some time and this method will wait for their
      * completion.
      */
-    m_connect->disconnect();
+    m_connect->close();
   }
 
 private:
@@ -210,8 +182,9 @@ private:
    * The data parameter is a byte array of received data and the len is actual size of stored bytes.
    * len <= data.size() for always
    */
-  void onData(std::vector<char> data, const size_t len)
+  void onData(const uint8_t* raw_data, size_t len)
   {
+      std::vector<char> data(raw_data, raw_data + len);
       //Parse incoming data:
       parseData(data, len);
   }
@@ -267,19 +240,19 @@ private:
                 switch(field_num) {
                 case 3:
                     temp = parseField(field);
-                    RCLCPP_DEBUG(get_logger(), "Parsed temp: %f", temp);
+                    LOG.debug() <<  "Parsed temp: " << temp;
                     break;
                 case 4:
                     ch4 = parseField(field);
-                    RCLCPP_DEBUG(get_logger(), "Parsed CH4: %f", ch4);
+                    LOG.debug() << "Parsed CH4: " << ch4;
                     break;
                 case 5:
                     h2o = parseField(field);
-                    RCLCPP_DEBUG(get_logger(), "Parsed H2O: %f", h2o);
+                    LOG.debug() << "Parsed H2O: " << h2o;
                     break;
                 case 6:
                     c2h6 = parseField(field);
-                    RCLCPP_DEBUG(get_logger(), "Parsed H2O: %f", c2h6);
+                    LOG.debug() << "Parsed H2O: " << c2h6;
                     break;
                 default:
                     //No interest in this field
@@ -313,13 +286,14 @@ private:
       record.push_back(h2o);
       record.push_back(c2h6);
       //Send to log
-      m_log->WriteRecord(record);
-      //Send to CPM on Ground:
+      m_log->writeRecord(record);
+      //Send to CPM widget. Use Scalar Widget to see the value.
       m_ground->sendScalarValue(ch4,
-                                MonitorMessage::PAYLOAD_ID_USER_PAYLOAD_FIRST,
-                                0xC0, //Place this ID into Payload Example widget settings
-                                MonitorMessage::STATE_GOOD);
-      RCLCPP_INFO(get_logger(), "- CH4: %f - Temp: %f - H2O: %f - C2H6: %f", ch4, temp, h2o, c2h6);
+              MonitorScalarTopic::MessageType::PAYLOAD_ID_ROS_CUSTOM,
+              MonitorScalarTopic::MessageType::MESSAGE_ID_CUSTOM_PAYLOAD_FIRST,
+              MonitorScalarTopic::MessageType::STATE_GOOD);
+      //Send text string to CPM. It will be shown on the console:
+      LOG.ui(true).info() << "- CH4: " << ch4 << " - Temp: " << temp << " - H2O: "<< h2o << " - C2H6: " << c2h6;
   }
 
   //Convert bytes of string representation into float
@@ -329,7 +303,7 @@ private:
   }
 
   //Here we store UART connection resource:
-  std::shared_ptr<ugcs_skyhub::connections::UartConnection> m_connect;
+  std::shared_ptr<ugcs_skyhub::connections::SerialConnection> m_connect;
   //Link to common log:
   std::shared_ptr<DataLog> m_log;
   //Channel to the ground:
@@ -346,29 +320,25 @@ private:
 int main(int argc, char * argv[])
 {
   /**
-   * Standart ROS2 initialization. At this step ROS2 framework may override default node names, logging levels
+   * ROS2 and Skyhub SDK initialization. At this step ROS2 framework may override default node names, logging levels
    * and so on.
    */
+    ugcs_skyhub::sdkInit(argc, argv);
+    /**
+     * Make instance of main driver class. At this moment Payload Node gets "Unconfigured" stage.
+     */
+    skyhub_aeris_strato::GasAnalyzerDriver node;
+    /**
+     * Enter node event loop. This method will block until node will not be shutdowned.
+     */
+    node.execute();
+    /**
+     * Clean up ROS2 framework resources after driver node finished it's life cycle.
+     */
+    ugcs_skyhub::sdkRelease();
+
+
   rclcpp::init(argc, argv);
-  /**
-   * Make instance of main driver class. At this moment Payload Node gets "Unconfigured" stage.
-   */
-  std::shared_ptr<skyhub_aeris_strato::GasAnalyzerDriver> analyzer =
-          std::make_shared<skyhub_aeris_strato::GasAnalyzerDriver>();
 
-  RCLCPP_INFO(analyzer->get_logger(), "Aeris Strato driver started");
-
-  /**
-   * Manuallu trigger configuration process: transition Unconfigured->Configuring->Inactive.
-   */
-  analyzer->configure();
-  /**
-   * Enter node event loop. This method will block until node will not be shutdowned.
-   */
-  rclcpp::spin(analyzer->get_node_base_interface());
-  /**
-   * Clean up ROS2 framework resources after driver node finished it's life cycle.
-   */
-  rclcpp::shutdown();
   return 0;
 }
